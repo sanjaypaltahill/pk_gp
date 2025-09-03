@@ -1,75 +1,115 @@
-import torch 
+import json
+import torch
 import gpytorch
-import numpy
+import numpy as np
+import pandas as pd
 from matplotlib import pyplot as plt
 
-# Set seed for reproducibility
-torch.manual_seed(18) 
+# ---------------------------
+# 1) Load & flatten JSON
+# ---------------------------
+with open("subject2.json") as f:
+    data = json.load(f)
 
-## STEP ONE: SIMULATE A DATASET ## 
-X_START = 0 ## Lowest x value ##
-X_END = 10 ## Highest x value ## 
-NUM_POINTS = 500 ## No. of x values ## 
-NOISE_VAR = 0 ## CHOOSE NOISE LEVEL ##
+records = []
+for row in data["array"]:
+    for entry in row:
+        records.append({
+            "time_hr": float(entry["time"]),
+            "conc_g_per_L": float(entry["value"]),
+            "subject": entry["individual"]["name"],
+            "dose": entry["interventions"][0]["name"],
+            "tissue": entry["tissue"]["name"],
+        })
 
-# Training inputs must be 2D: [N, 1]
-x_vals = torch.linspace(X_START, X_END, NUM_POINTS).unsqueeze(-1) 
+df = pd.DataFrame(records).sort_values("time_hr").reset_index(drop=True)
 
-y_true = torch.sin(x_vals).squeeze() ## SPECIFY TRUE FUNCTION f ##
-noise_var = torch.tensor(NOISE_VAR) # Convert noise var to a tensor
-noise_std = torch.sqrt(noise_var)   # Calculate std of noise
-error_vals = noise_std * torch.randn_like(y_true) 
-y = y_true + error_vals # Add Gaussian noise
+# Optional: rescale to mg/L for better conditioning (values ~ 1–20 instead of ~0.001–0.01)
+df["conc_mg_per_L"] = df["conc_g_per_L"] * 1000.0
 
-## STEP TWO: Define GP Model ##
+# ---------------------------------
+# 2) Prepare tensors for GPyTorch
+# ---------------------------------
+# Train inputs must be shape [N, 1]
+x_train = torch.tensor(df["time_hr"].values, dtype=torch.float32).unsqueeze(-1)
+y_train = torch.tensor(df["conc_mg_per_L"].values, dtype=torch.float32)
+
+# ---------------------------------
+# 3) Define an Exact GP model
+# ---------------------------------
 class ExactGPModel(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood):
-        super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
+        super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ConstantMean()
-        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
+        # RBF kernel with outputscale (amplitude) learned; add small jitter through default settings
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.RBFKernel()
+        )
 
     def forward(self, x):
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)    
-        
-## STEP THREE: Initialize likelihood and model ##
-likelihood = gpytorch.likelihoods.GaussianLikelihood()
-model = ExactGPModel(x_vals, y, likelihood)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
-## STEP FOUR: Train the GP ##
+# ---------------------------------
+# 4) Initialize likelihood & model
+# ---------------------------------
+torch.manual_seed(18)
+likelihood = gpytorch.likelihoods.GaussianLikelihood()
+model = ExactGPModel(x_train, y_train, likelihood)
+
+# ---------------------------------
+# 5) Train the GP
+# ---------------------------------
 model.train()
 likelihood.train()
+
 optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
 mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
 
-training_iterations = 100
-for i in range(training_iterations):
+for i in range(100):
     optimizer.zero_grad()
-    output = model(x_vals)
-    loss = -mll(output, y)
+    output = model(x_train)
+    loss = -mll(output, y_train)
     loss.backward()
-    if (i+1) % 20 == 0:
-        print(f"Iter {i+1}/{training_iterations} - Loss: {loss.item():.3f}")
     optimizer.step()
+    if (i + 1) % 20 == 0:
+        print(f"Iter {i+1}/100 - Loss: {loss.item():.3f} | "
+              f"noise: {likelihood.noise.item():.4f} | "
+              f"lengthscale: {model.covar_module.base_kernel.lengthscale.item():.3f}")
 
-## STEP FIVE: Make predictions ##
+# ---------------------------------
+# 6) Predict on a dense grid
+# ---------------------------------
 model.eval()
 likelihood.eval()
-x_test = torch.linspace(X_START * -1, X_END*2, 50).unsqueeze(-1)  # test inputs also [M,1]
+
+x_min, x_max = float(df["time_hr"].min()), float(df["time_hr"].max())
+pad = 0.5
+x_test = torch.linspace(max(0.0, x_min - pad), x_max + pad, 200).unsqueeze(-1)
 
 with torch.no_grad(), gpytorch.settings.fast_pred_var():
-    observed_pred = likelihood(model(x_test))
+    pred = likelihood(model(x_test))
 
-## STEP SIX: Extract mean and confidence intervals ##
-mean = observed_pred.mean
-lower, upper = observed_pred.confidence_region()
+mean = pred.mean
+lower, upper = pred.confidence_region()
 
+# ---------------------------------
+# 7) Plot (in mg/L)
+# ---------------------------------
 plt.figure(figsize=(8,5))
-plt.plot(x_vals.squeeze().numpy(), y_true.numpy(), 'r', label='True function')
-plt.scatter(x_vals.squeeze().numpy(), y.numpy(), label='Noisy observations')
-plt.plot(x_test.squeeze().numpy(), mean.numpy(), 'b', label='GP mean')
-plt.fill_between(x_test.squeeze().numpy(), lower.numpy(), upper.numpy(), color='blue', alpha=0.3, label='Confidence')
+plt.scatter(df["time_hr"], df["conc_mg_per_L"], label="Observed (mg/L)")
+plt.plot(x_test.squeeze().numpy(), mean.numpy(), label="GP mean")
+plt.fill_between(
+    x_test.squeeze().numpy(),
+    lower.numpy(),
+    upper.numpy(),
+    alpha=0.3,
+    label="95% CI"
+)
+plt.xlabel("Time (hr)")
+plt.ylabel("Paracetamol (mg/L)")
+plt.title("Gaussian Process fit to saliva concentrations")
 plt.legend()
-plt.title("GP Regression Fit")
+plt.tight_layout()
 plt.show()
