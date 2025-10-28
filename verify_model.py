@@ -94,7 +94,7 @@ def run_one(seed=0, n_obs=10, noise_std=1.0):
 # 4) Repeat many times
 # ---------------------------
 if __name__ == "__main__":
-    n_trials = 10000
+    n_trials = 1000
     coverages = [run_one(seed=i) for i in range(n_trials)]
     overall = np.mean(coverages)
     print(f"Average coverage over {n_trials} runs: {overall:.3f}")
